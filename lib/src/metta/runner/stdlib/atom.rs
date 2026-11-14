@@ -4,12 +4,10 @@ use crate::metta::*;
 use crate::metta::text::Tokenizer;
 use crate::metta::types::{AtomType, get_atom_types, get_meta_type};
 use hyperon_atom::matcher::atoms_are_equivalent;
-use hyperon_common::multitrie::{MultiTrie, TrieKey, TrieToken};
 use super::{grounded_op, regex};
 use hyperon_atom::gnd::number::*;
 
 use std::convert::TryInto;
-use std::hash::{DefaultHasher, Hasher};
 
 #[derive(Clone, Debug)]
 pub struct UniqueAtomOp {}
@@ -85,66 +83,14 @@ impl Grounded for IntersectionAtomOp {
     }
 }
 
-fn atom_to_trie_key(atom: &Atom) -> TrieKey<SymbolAtom> {
-    fn fill_key(atom: &Atom, tokens: &mut Vec<TrieToken<SymbolAtom>>) {
-        match atom {
-            Atom::Symbol(sym) => tokens.push(TrieToken::Exact(sym.clone())),
-            Atom::Expression(expr) => {
-                tokens.push(TrieToken::LeftPar);
-                expr.children().iter().for_each(|child| fill_key(child, tokens));
-                tokens.push(TrieToken::RightPar);
-            },
-            Atom::Grounded(g) if g.as_grounded().as_match().is_none() => {
-                // TODO: Adding Hash on grounded atoms matched by equality is
-                // required in order to make TrieToken::Exact be generated for
-                // them.
-                let mut h = DefaultHasher::new();
-                match (*g).serialize(&mut h) {
-                    Ok(()) => { tokens.push(TrieToken::Exact(SymbolAtom::new(h.finish().to_string().into()))) }
-                    Err(_) => { tokens.push(TrieToken::Wildcard) }
-                }
-            }
-            _ => tokens.push(TrieToken::Wildcard),
-        }
-    }
-
-    let mut tokens = Vec::new();
-    fill_key(atom, &mut tokens);
-    TrieKey::from(tokens)
-}
-
-
 impl CustomExecute for IntersectionAtomOp {
     fn execute(&self, args: &[Atom]) -> Result<Vec<Atom>, ExecError> {
         let arg_error = || ExecError::from("intersection expects and executable LHS and RHS atom");
         let mut lhs: Vec<Atom> = TryInto::<&ExpressionAtom>::try_into(args.get(0).ok_or_else(arg_error)?)?.children().into();
         let rhs = TryInto::<&ExpressionAtom>::try_into(args.get(1).ok_or_else(arg_error)?)?.children();
 
-        // Multiset intersection: consume each RHS element at most once.
-        //
-        // The previous implementation indexed RHS in a `MultiTrie` and called
-        // `get(&k).next()`. Two defects followed from that, and both dropped
-        // members of the intersection depending on heap layout:
-        //
-        //   1. `atom_to_trie_key` maps EVERY variable to the same `Wildcard`,
-        //      and a wildcard query matches any stored key. During index
-        //      construction `get(&k).next()` therefore merged an unrelated
-        //      bucket -- e.g. symbol `A`'s -- under the wildcard key, after
-        //      which `A` could no longer be found under its own key.
-        //   2. At lookup, `.next()` picked one of several matching buckets in
-        //      HashMap iteration order and gave up if that bucket held no
-        //      equal atom; `remove(&k, ..)` then removed under the candidate's
-        //      key, which for a variable is again that shared wildcard.
-        //
-        // Measured on `(A $x B $y C)` against `($y C A $x B)`, whose correct
-        // intersection is all five atoms: the old code returned 5 atoms in 9
-        // of 15 runs and 3 in the other 6, varying between processes.
-        //
-        // Note the trie only ever served as a lookup index; correctness never
-        // depended on it. This is O(|lhs| * |rhs|) rather than sub-quadratic.
-        // If that matters for large inputs, the index must be keyed so that
-        // distinct variables do not collide -- the wildcard collapse above is
-        // what makes the trie unsafe here, not the trie itself.
+        // Consume each equal RHS occurrence once, retaining LHS order and values.
+        // Variables are compared by identity, not matched as trie wildcards.
         let mut used = vec![false; rhs.len()];
         lhs.retain(|candidate| {
             match rhs.iter().enumerate().find(|(i, r)| !used[*i] && *r == candidate) {
@@ -297,11 +243,7 @@ impl CustomExecute for SubtractionAtomOp {
         let mut lhs: Vec<Atom> = TryInto::<&ExpressionAtom>::try_into(args.get(0).ok_or_else(arg_error)?)?.children().into();
         let rhs = TryInto::<&ExpressionAtom>::try_into(args.get(1).ok_or_else(arg_error)?)?.children();
 
-        // Multiset difference: remove each RHS element from LHS at most once.
-        // Same two defects as `intersection-atom` -- every variable collapses
-        // to one `Wildcard` trie key, and `get(&k).next()` plus
-        // `remove(&k, ..)` then merged and evicted unrelated buckets in
-        // HashMap iteration order. See the comment there for the measurement.
+        // Consume each equal RHS occurrence once; keep unmatched LHS values.
         let mut used = vec![false; rhs.len()];
         lhs.retain(|candidate| {
             match rhs.iter().enumerate().find(|(i, r)| !used[*i] && *r == candidate) {
@@ -638,19 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn index_atom_to_key() {
-        assert_eq!(atom_to_trie_key(&Atom::sym("A")), TrieKey::from([TrieToken::Exact(SymbolAtom::new("A".into()))]));
-        assert_eq!(atom_to_trie_key(&Atom::value(1)), TrieKey::from([TrieToken::Wildcard]));
-        assert_eq!(atom_to_trie_key(&Atom::var("a")), TrieKey::from([TrieToken::Wildcard]));
-        assert_eq!(atom_to_trie_key(&expr!("A" "B")), TrieKey::from([
-                TrieToken::LeftPar,
-                TrieToken::Exact(SymbolAtom::new("A".into())),
-                TrieToken::Exact(SymbolAtom::new("B".into())),
-                TrieToken::RightPar
-        ]));
-    }
-
-    #[test]
     fn intersection_op() {
         let intersection_op = IntersectionAtomOp{};
         let actual = intersection_op.execute(&mut vec![expr!(
@@ -709,6 +638,96 @@ mod tests {
             )]).unwrap();
         assert_eq_no_order!(actual,
                    vec![expr!(("A" ("B" "C")) ("f" "g") ("f" "g") ("P" "b"))]);
+    }
+
+    #[test]
+    fn multiset_ops_preserve_variable_identity_and_left_order() {
+        let x = Atom::var("x");
+        let other_x = Atom::Variable(VariableAtom::new_id("x", 1));
+        let lhs = Atom::expr([x.clone(), sym!("A"), other_x.clone(), x.clone(), sym!("B")]);
+        let rhs = Atom::expr([sym!("B"), x.clone(), sym!("A")]);
+
+        assert_eq!(IntersectionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+            vec![Atom::expr([x.clone(), sym!("A"), sym!("B")])]);
+        assert_eq!(SubtractionAtomOp{}.execute(&[lhs, rhs]).unwrap(),
+            vec![Atom::expr([other_x, x])]);
+    }
+
+    #[test]
+    fn multiset_ops_keep_all_variable_members_in_every_rhs_order() {
+        use itertools::Itertools;
+
+        let members = vec![sym!("A"), Atom::var("x"), sym!("B"), Atom::var("y"), sym!("C")];
+        let lhs = Atom::expr(members.clone());
+        for order in members.into_iter().permutations(5) {
+            let rhs = Atom::expr(order);
+            assert_eq!(IntersectionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+                vec![lhs.clone()], "RHS: {rhs}");
+            assert_eq!(SubtractionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+                vec![expr!()], "RHS: {rhs}");
+        }
+    }
+
+    #[test]
+    fn multiset_ops_consume_numeric_duplicates_once() {
+        let lhs = expr!({Number::Integer(2)} {Number::Float(1.0)} {Number::Integer(1)}
+            {Number::Float(-0.0)} {Number::Integer(2)});
+        let rhs = expr!({Number::Integer(0)} {Number::Integer(1)} {Number::Integer(2)});
+
+        assert_eq!(IntersectionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+            vec![expr!({Number::Integer(2)} {Number::Float(1.0)} {Number::Float(-0.0)})]);
+        assert_eq!(SubtractionAtomOp{}.execute(&[lhs, rhs]).unwrap(),
+            vec![expr!({Number::Integer(1)} {Number::Integer(2)})]);
+    }
+
+    #[test]
+    fn multiset_ops_use_grounded_equality_instead_of_serialization() {
+        #[derive(Clone, Debug)]
+        struct NumericAlias(i64);
+
+        // Equal grounded values may have different numeric encodings.
+        impl PartialEq for NumericAlias {
+            fn eq(&self, _: &Self) -> bool { true }
+        }
+        impl std::fmt::Display for NumericAlias {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "alias:{}", self.0)
+            }
+        }
+        impl Grounded for NumericAlias {
+            fn type_(&self) -> Atom { ATOM_TYPE_NUMBER }
+            fn serialize(&self, serializer: &mut dyn hyperon_atom::serial::Serializer)
+                -> hyperon_atom::serial::Result {
+                serializer.serialize_i64(self.0)
+            }
+        }
+
+        let first = Atom::gnd(NumericAlias(1));
+        let equal = Atom::gnd(NumericAlias(3));
+        assert_eq!(first, equal);
+        let lhs = Atom::expr([first.clone(), first]);
+        let rhs = Atom::expr([equal]);
+
+        for result in [IntersectionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+            SubtractionAtomOp{}.execute(&[lhs, rhs]).unwrap()] {
+            let output = <&ExpressionAtom>::try_from(&result[0]).unwrap().children();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].as_gnd::<NumericAlias>().unwrap().0, 1);
+        }
+    }
+
+    #[test]
+    fn multiset_ops_preserve_empty_and_disjoint_results() {
+        for (lhs, rhs, common, remaining) in [
+            (expr!(), expr!(), expr!(), expr!()),
+            (expr!("A" "A"), expr!(), expr!(), expr!("A" "A")),
+            (expr!(), Atom::expr([sym!("A")]), expr!(), expr!()),
+            (Atom::expr([sym!("A")]), Atom::expr([sym!("B")]), expr!(), Atom::expr([sym!("A")])),
+        ] {
+            assert_eq!(IntersectionAtomOp{}.execute(&[lhs.clone(), rhs.clone()]).unwrap(),
+                vec![common]);
+            assert_eq!(SubtractionAtomOp{}.execute(&[lhs, rhs]).unwrap(), vec![remaining]);
+        }
     }
 
     #[test]
